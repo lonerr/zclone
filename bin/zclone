@@ -1,0 +1,156 @@
+#!/bin/sh
+
+[ $# -lt 1 ] && {
+	echo config file required
+	exit 1
+}
+set -e && . "$1" && set +e
+
+# Required parameters
+[ -z "$master_host" ] && {
+	echo "'master_host' required"
+	exit 1
+}
+[ -z "$master_set" ] && {
+	echo "'master_set' required"
+	exit 1
+}
+
+# Profile name
+: ${profile_name:=}
+[ -n "$profile_name" ] && {
+	profile_dash_suffix="-$profile_name"
+	profile_slash_suffix="/$profile_name"
+	profile_syslog_prefix="[$profile_name] "
+}
+
+# ZFS set to receive changes (slave)
+: ${local_set:=$master_set}
+
+# How many snapshots to keep (both sides)?
+: ${master_keep_snapshots:="10"}
+: ${local_keep_snapshots:=$master_keep_snapshots}
+
+# Syslog parameters
+: ${syslog_facility:="user"}
+: ${syslog_program:=$( basename $0 )}
+
+# Sleeping between cycles
+: ${loop_pause:="0"}
+
+# Delayed stale snapshots purging
+: ${purge_delay_loops:="0"}
+
+# PID file
+: ${pid_file:="/tmp/zclone$profile_dash_suffix.pid"}
+
+# Remote commands executing
+: ${master_user:=`whoami`}
+: ${remote_command_timeout:="30"}
+: ${remote_command:="rsh -t $remote_command_timeout -l $master_user $master_host"}
+# ${remote_command:="ssh -o ConnectTimeout=$remote_command_timeout $master_user@$master_host"}
+
+# Linked clone mode
+: ${local_link:=}
+: ${local_mount_root:="/mnt/zclone$profile_slash_suffix"}
+
+
+log () {
+	[ $# -gt 1 ] && { _priority=$1; shift; } || { _priority=info; }	
+	echo "${profile_syslog_prefix}$@" | logger -p $syslog_facility.$_priority -t $syslog_program
+}
+die () {
+	log crit "$@", exit
+	exit 1
+}
+
+# self executing (due to stderr capturing to syslog and lock file handling)
+[ $# -lt 2 ] && {
+	log "Launching daemon"
+	{
+		lockf -kt0 $pid_file $0 $* daemon 2>&1 || {
+			_err=$?
+			[ $_err -eq 1 -o $_err -eq 70 ] && { log "Daemon stopped ($_err)"; exit; }
+			log crit "Can't acquire daemon lock ($_err)"; exit 1
+		}
+	} | logger -p $syslog_facility.info -t $syslog_program &
+	exit
+}
+
+# starting
+log "Started daemon ($$)"
+echo $$ > $pid_file || die "Can't write PID"
+_purge_loop=$purge_delay_loops
+
+while true; do
+	_now=`date +%Y-%m-%d.%H:%M:%S`
+	log "Loop started at $_now"
+	_begin=`date -jf %Y-%m-%d.%H:%M:%S +%s $_now`
+
+	# get last local snapshot
+	_list=`zfs list -Hrt snapshot $local_set` || die "Can't get list of local snapshots"
+	_last=`echo "$_list" | grep @zclone$profile_dash_suffix- | awk 'END {print $1}' | awk -F@ '{print $2}'` || die "Can't get last local snapshot"
+	log "Last local snapshot '$_last'"
+
+	# create new snapshot on master
+	$remote_command "sudo zfs snapshot $master_set@zclone$profile_dash_suffix-$_now" || die "Can't create snapshot"
+	log "Created master snapshot '$master_set@zclone$profile_dash_suffix-$_now'"
+
+	# send & recv delta
+	socketpipe -l \{ $remote_command \} -r \{ sudo zfs send -vi @$_last $master_set@zclone$profile_dash_suffix-$_now \} -o \{ sudo zfs recv -dv $local_set \} || die "Pipe of send/recv failed"
+	log "Got master snapshot '$master_set@zclone-$_now'"
+
+	if [ -n "$local_link" ]; then
+		# clone received snapshot
+		sudo zfs clone -o atime=off -o mountpoint=$local_mount_root/$_now -o readonly=on -o setuid=off $local_set@zclone$profile_dash_suffix-$_now $local_set:zclone$profile_dash_suffix-$_now || die "Snapshot cloning failed"
+		log "Local snapshot cloned as '$local_set:zclone$profile_dash_suffix-$_now'"
+
+		# symlink
+		sudo ln -fhs $local_mount_root/$_now $local_link || die "Clone linking failed"
+		log "Local snapshot linked as '$local_link'"
+	fi
+
+	if [ $_purge_loop -gt 0 ]; then
+		log "Remains $_purge_loop loop(s) till purging"
+		_purge_loop=$(( $_purge_loop - 1 ))
+	else
+		# purge local snapshots
+		_list=`zfs list -Hrt snapshot $local_set` || die "Can't get list of local snapshots"
+		_outdated=`echo "$_list" | grep @zclone$profile_dash_suffix- | tail -r | awk 'NR>'$local_keep_snapshots' {print $1}'`
+		_purged=0
+		_staled=0
+		for _snapshot in $_outdated; do
+			sudo zfs destroy -R $_snapshot || {
+				_staled=$(( $_staled + 1 ))
+				log warn "Can't destroy outdated local snapshot '$_snapshot'"
+				continue
+			}
+			_purged=$(( $_purged + 1 ))
+			[ -z "$local_link" ] && continue
+
+			_tstamp=${_snapshot#$local_set@zclone$profile_dash_suffix-}
+			if [ -d $local_mount_root/$_tstamp ]; then
+				sudo rmdir $local_mount_root/$_tstamp ||
+					log warn "Can't remove mount point '$local_mount_root/$_tstamp'"
+			fi
+		done
+		log "Purged $_purged outdated local snapshots, $_staled staled"
+
+		# purge master snapshots
+		_list=`$remote_command "zfs list -Hrt snapshot $master_set"` || die "Can't get list of master snapshots"
+		_outdated=`echo "$_list" | grep @zclone$profile_dash_suffix- | tail -r | awk 'NR>'$master_keep_snapshots' {print $1}'`
+		echo "$_outdated" | $remote_command "xargs -n1 sudo zfs destroy" || die "Can't destroy outdated master snapshots"
+		log "Purged "$((`echo "$_outdated" | grep -v '^$' | wc -l`))" outdated master snapshot(s)"
+
+		_purge_loop=$purge_delay_loops
+	fi
+
+	_end=`date +%s`
+	_elapsed=$( echo $_end-$_begin | bc )
+	log "Completed at "`date -jf %s +%Y-%m-%d.%H:%M:%S $_end`" successfully, elapsed $_elapsed second(s)"
+
+	[ $loop_pause -gt 0 ] && {
+		log "Sleeping for $loop_pause second(s)"
+		sleep $loop_pause
+	}
+done
